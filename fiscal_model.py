@@ -1,0 +1,339 @@
+"""
+fiscal_model.py
+---------------
+Leonia 2030 — Core Fiscal & Infrastructure Impact Model.
+
+Calculates the NET FISCAL IMPACT of a proposed mixed-use development:
+    net = (new tax revenue) - (cost of educating new pupils +
+                               cost of serving new residents)
+
+Also calculates the new PM-peak traffic load on the Grand Ave corridor.
+A Monte Carlo runner varies market value and interest rates to produce
+best-case/worst-case fiscal envelopes.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, List
+import numpy as np
+
+import leonia_constants as L
+
+
+# =============================================================================
+# DATA STRUCTURES
+# =============================================================================
+
+@dataclass
+class Development:
+    """A proposed mixed-use development on a Leonia MX-zone parcel."""
+
+    # Residential mix — number of units of each type
+    studios: int       = 0
+    one_bedroom: int   = 0
+    two_bedroom: int   = 0
+    three_bedroom: int = 0
+
+    # Ground-floor / commercial component
+    retail_sf:  int = 0   # gross SF of retail space
+    office_sf:  int = 0   # gross SF of office space
+
+    # Per-SF MARKET VALUES (these are the Monte-Carlo varied parameters)
+    res_value_per_sf:    float = L.MARKET_VALUE_PER_SF["residential_mean"]
+    retail_value_per_sf: float = L.MARKET_VALUE_PER_SF["retail_mean"]
+
+    # PILOT (Payment-in-Lieu-of-Taxes) — common in NJ redevelopment areas.
+    # If pilot_active=True, the developer pays a flat % of *gross revenue*
+    # instead of standard property tax. NJ Long-Term Tax Exemption Law
+    # typically uses 10-15% of annual gross rent for residential.
+    pilot_active: bool = False
+    pilot_rate_residential: float = 0.10   # 10% of gross rent (typical NJ PILOT)
+    pilot_rate_commercial:  float = 0.15   # 15% for commercial
+    avg_annual_rent_per_unit: float = 28_000   # ~$2,300/mo, Bergen Co. mid-rise
+    avg_annual_rent_per_retail_sf: float = 35   # $/SF/yr triple-net
+
+    @property
+    def total_units(self) -> int:
+        return (self.studios + self.one_bedroom +
+                self.two_bedroom + self.three_bedroom)
+
+    @property
+    def net_residential_sf(self) -> int:
+        """Sellable/rentable SF (excludes common areas)."""
+        return (self.studios       * L.AVG_UNIT_SF["studio"]      +
+                self.one_bedroom   * L.AVG_UNIT_SF["1_bedroom"]   +
+                self.two_bedroom   * L.AVG_UNIT_SF["2_bedroom"]   +
+                self.three_bedroom * L.AVG_UNIT_SF["3_bedroom"])
+
+    @property
+    def gross_residential_sf(self) -> int:
+        """Includes corridors, lobbies, mechanical — used for assessed value."""
+        return int(self.net_residential_sf * L.GROSS_TO_NET_FACTOR)
+
+
+# =============================================================================
+# REVENUE SIDE
+# =============================================================================
+
+def calculate_assessed_value(dev: Development) -> float:
+    """
+    Convert market value -> assessed value using Leonia's Equalization Ratio.
+
+        Market Value  =  SF × $/SF
+        Assessed Value = Market Value × Equalization Ratio
+
+    Why equalization? NJ municipalities assess properties at a fraction of
+    true market value. Leonia's ratio is ~63%, meaning a $1M home is on the
+    tax rolls at ~$633k. The GENERAL tax rate is then applied to that.
+    """
+    res_market    = dev.gross_residential_sf * dev.res_value_per_sf
+    retail_market = dev.retail_sf            * dev.retail_value_per_sf
+    office_market = dev.office_sf            * dev.retail_value_per_sf  # similar comp
+
+    total_market   = res_market + retail_market + office_market
+    total_assessed = total_market * L.EQUALIZATION_RATIO
+    return total_assessed
+
+
+def calculate_annual_tax_revenue(dev: Development) -> float:
+    """
+    Annual property-tax revenue to the Borough from a new development.
+    If a PILOT is active, returns the PILOT payment instead of standard
+    property tax — typically much lower for the municipality, which is why
+    PILOTs are politically contested.
+    """
+    if dev.pilot_active:
+        res_rent    = dev.total_units * dev.avg_annual_rent_per_unit
+        retail_rent = dev.retail_sf   * dev.avg_annual_rent_per_retail_sf
+        office_rent = dev.office_sf   * dev.avg_annual_rent_per_retail_sf
+        return (res_rent    * dev.pilot_rate_residential +
+                (retail_rent + office_rent) * dev.pilot_rate_commercial)
+
+    assessed = calculate_assessed_value(dev)
+    return assessed * L.GENERAL_TAX_RATE
+
+
+# =============================================================================
+# COST SIDE
+# =============================================================================
+
+def calculate_new_pupils(dev: Development) -> float:
+    """
+    Estimate Public School-Age Children (PSAC) generated by the development.
+    Uses Rutgers CUPR NJ-specific multipliers for new multifamily housing.
+    """
+    m = L.DEMOGRAPHIC_MULTIPLIERS
+    return (dev.studios       * m["studio"]["psac"]      +
+            dev.one_bedroom   * m["1_bedroom"]["psac"]   +
+            dev.two_bedroom   * m["2_bedroom"]["psac"]   +
+            dev.three_bedroom * m["3_bedroom"]["psac"])
+
+
+def calculate_new_residents(dev: Development) -> float:
+    """Total new residents (used for non-school municipal service costs)."""
+    m = L.DEMOGRAPHIC_MULTIPLIERS
+    return (dev.studios       * m["studio"]["household_size"]      +
+            dev.one_bedroom   * m["1_bedroom"]["household_size"]   +
+            dev.two_bedroom   * m["2_bedroom"]["household_size"]   +
+            dev.three_bedroom * m["3_bedroom"]["household_size"])
+
+
+def calculate_school_cost(dev: Development) -> float:
+    """Annual cost to educate new pupils at Leonia's per-pupil rate."""
+    return calculate_new_pupils(dev) * L.COST_PER_PUPIL
+
+
+def calculate_municipal_service_cost(dev: Development) -> float:
+    """Annual cost of police, DPW, road maintenance, etc. for new residents."""
+    return calculate_new_residents(dev) * L.MUNICIPAL_SERVICE_COST_PER_RESIDENT
+
+
+# =============================================================================
+# TRAFFIC IMPACT
+# =============================================================================
+
+def calculate_pm_peak_trips(dev: Development) -> Dict[str, float]:
+    """
+    PM peak-hour vehicle trip generation using ITE 11th Edition rates,
+    with pass-by reduction for retail (cars already on Grand Ave).
+    """
+    rates   = L.ITE_TRIP_RATES_PM_PEAK
+    pass_by = L.PASS_BY_FACTOR
+
+    # Residential — assume mid-rise product type (Grand Ave corridor default)
+    res_trips = dev.total_units * rates["multifamily_mid_rise"]
+
+    # Retail (NEW trips only — subtract pass-by)
+    retail_gross = (dev.retail_sf / 1000.0) * rates["shopping_center"]
+    retail_new   = retail_gross * (1 - pass_by["shopping_center"])
+
+    # Office (commuters — no pass-by)
+    office_trips = (dev.office_sf / 1000.0) * rates["general_office"]
+
+    total_new = res_trips + retail_new + office_trips
+    projected_corridor = L.GRAND_AVE_PM_BASELINE_TRIPS + total_new
+
+    return {
+        "residential_trips":  round(res_trips, 1),
+        "retail_new_trips":   round(retail_new, 1),
+        "office_trips":       round(office_trips, 1),
+        "total_new_trips":    round(total_new, 1),
+        "projected_corridor": round(projected_corridor, 1),
+        "los_c_capacity":     L.GRAND_AVE_LOS_C_CAPACITY,
+        "los_e_capacity":     L.GRAND_AVE_LOS_E_CAPACITY,
+        "exceeds_los_c":      projected_corridor > L.GRAND_AVE_LOS_C_CAPACITY,
+        "exceeds_los_e":      projected_corridor > L.GRAND_AVE_LOS_E_CAPACITY,
+    }
+
+
+# =============================================================================
+# TOP-LEVEL FISCAL IMPACT
+# =============================================================================
+
+def fiscal_impact(dev: Development) -> Dict[str, float]:
+    """
+    Single deterministic run of the model. Returns a dict suitable for
+    JSON serialization or dashboard display.
+    """
+    revenue        = calculate_annual_tax_revenue(dev)
+    school_cost    = calculate_school_cost(dev)
+    municipal_cost = calculate_municipal_service_cost(dev)
+    total_cost     = school_cost + municipal_cost
+    net            = revenue - total_cost
+
+    return {
+        "assessed_value":          round(calculate_assessed_value(dev), 0),
+        "annual_tax_revenue":      round(revenue, 0),
+        "new_pupils":              round(calculate_new_pupils(dev), 2),
+        "new_residents":           round(calculate_new_residents(dev), 1),
+        "annual_school_cost":      round(school_cost, 0),
+        "annual_municipal_cost":   round(municipal_cost, 0),
+        "annual_total_cost":       round(total_cost, 0),
+        "net_fiscal_impact":       round(net, 0),
+        "revenue_to_cost_ratio":   round(revenue / total_cost, 2) if total_cost else float("inf"),
+        "break_even":              net >= 0,
+        "traffic":                 calculate_pm_peak_trips(dev),
+    }
+
+
+# =============================================================================
+# MONTE CARLO — best case / worst case envelope
+# =============================================================================
+
+def monte_carlo(
+    base_dev: Development,
+    n_iterations: int = 1000,
+    res_value_std: float = L.MARKET_VALUE_PER_SF["residential_std"],
+    retail_value_std: float = L.MARKET_VALUE_PER_SF["retail_std"],
+    interest_rate_mean: float = 0.065,
+    interest_rate_std:  float = 0.015,
+    interest_rate_sensitivity: float = 30.0,  # $/SF impact per +1% rate
+    seed: int | None = 42,
+) -> Dict[str, np.ndarray]:
+    """
+    Run N simulations varying:
+        - residential $/SF       (Gaussian around the base value)
+        - retail      $/SF       (Gaussian around the base value)
+        - interest rate          (affects market value — higher rate, lower comp)
+
+    Returns numpy arrays of net fiscal impact + diagnostics for each run.
+    """
+    rng = np.random.default_rng(seed)
+
+    nets, revenues, costs, pupils = [], [], [], []
+
+    for _ in range(n_iterations):
+        # Sample market parameters
+        res_val    = rng.normal(base_dev.res_value_per_sf, res_value_std)
+        retail_val = rng.normal(base_dev.retail_value_per_sf, retail_value_std)
+        rate       = rng.normal(interest_rate_mean, interest_rate_std)
+
+        # Interest-rate sensitivity: comp values move INVERSELY with rates.
+        rate_delta = rate - interest_rate_mean
+        res_val    -= rate_delta * 100 * interest_rate_sensitivity / 100
+        retail_val -= rate_delta * 100 * (interest_rate_sensitivity * 0.6) / 100
+
+        # Floor at sensible minimums to avoid negative comps in tail draws
+        res_val    = max(res_val,    150)
+        retail_val = max(retail_val, 100)
+
+        sim_dev = Development(
+            studios       = base_dev.studios,
+            one_bedroom   = base_dev.one_bedroom,
+            two_bedroom   = base_dev.two_bedroom,
+            three_bedroom = base_dev.three_bedroom,
+            retail_sf     = base_dev.retail_sf,
+            office_sf     = base_dev.office_sf,
+            res_value_per_sf    = res_val,
+            retail_value_per_sf = retail_val,
+        )
+
+        rev  = calculate_annual_tax_revenue(sim_dev)
+        cst  = calculate_school_cost(sim_dev) + calculate_municipal_service_cost(sim_dev)
+        nets.append(rev - cst)
+        revenues.append(rev)
+        costs.append(cst)
+        pupils.append(calculate_new_pupils(sim_dev))
+
+    return {
+        "net_impact":   np.array(nets),
+        "revenue":      np.array(revenues),
+        "cost":         np.array(costs),
+        "pupils":       np.array(pupils),
+    }
+
+
+def summarize_monte_carlo(results: Dict[str, np.ndarray]) -> Dict[str, float]:
+    """Pull the headline statistics out of a Monte Carlo run."""
+    net = results["net_impact"]
+    return {
+        "mean_net_impact":   round(float(net.mean()), 0),
+        "median_net_impact": round(float(np.median(net)), 0),
+        "p5_worst_case":     round(float(np.percentile(net, 5)),  0),
+        "p95_best_case":     round(float(np.percentile(net, 95)), 0),
+        "std_dev":           round(float(net.std()), 0),
+        "prob_positive":     round(float((net > 0).mean()), 3),
+        "n_iterations":      len(net),
+    }
+
+
+# =============================================================================
+# DEMO
+# =============================================================================
+
+if __name__ == "__main__":
+    # Hypothetical Grand Ave mixed-use proposal
+    proposal = Development(
+        studios       = 12,
+        one_bedroom   = 48,
+        two_bedroom   = 30,
+        three_bedroom = 6,
+        retail_sf     = 8500,
+        office_sf     = 0,
+    )
+
+    print("=" * 62)
+    print("LEONIA 2030 — Deterministic Fiscal Impact (Single Run)")
+    print("=" * 62)
+    result = fiscal_impact(proposal)
+    for k, v in result.items():
+        if k == "traffic":
+            print(f"\nTraffic (PM Peak):")
+            for tk, tv in v.items():
+                print(f"  {tk:<25} {tv}")
+        else:
+            if isinstance(v, float) and abs(v) > 1000:
+                print(f"  {k:<25} ${v:>15,.0f}")
+            else:
+                print(f"  {k:<25} {v}")
+
+    print("\n" + "=" * 62)
+    print("MONTE CARLO (1,000 iterations)")
+    print("=" * 62)
+    mc = monte_carlo(proposal, n_iterations=1000)
+    summary = summarize_monte_carlo(mc)
+    for k, v in summary.items():
+        if isinstance(v, float) and abs(v) > 1000:
+            print(f"  {k:<25} ${v:>15,.0f}")
+        else:
+            print(f"  {k:<25} {v}")
